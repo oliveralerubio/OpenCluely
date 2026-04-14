@@ -221,7 +221,10 @@ class LLMService {
 
   formatImageInstruction(activeSkill, programmingLanguage) {
     const langNote = programmingLanguage ? ` Use only ${programmingLanguage.toUpperCase()} for any code.` : '';
-    return `Analyze this image for a ${activeSkill.toUpperCase()} question. Extract the problem concisely and provide the best possible solution with explanation and final code.${langNote}`;
+    const skillHint = (activeSkill && activeSkill !== 'general')
+      ? ` Focus on ${activeSkill.toUpperCase()} context.`
+      : '';
+    return `Analyze this screenshot and identify the question or task being asked. Provide the best possible answer — adapt your format to what the question needs (code, explanation, design, or advice).${skillHint}${langNote}`;
   }
 
   async processTextWithSkill(text, activeSkill, sessionMemory = [], programmingLanguage = null) {

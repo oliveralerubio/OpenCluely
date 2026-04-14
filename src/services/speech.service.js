@@ -1052,11 +1052,26 @@ class SpeechService extends EventEmitter {
       return;
     }
 
-    this._startMicrophoneCaptureWithFallback(['sox', 'rec', 'arecord']);
+    this._startMicrophoneCaptureWithFallback(['arecord', 'sox', 'rec']);
+  }
+
+  _getSystemAudioMonitor() {
+    try {
+      const { execSync } = require('child_process');
+      const defaultSink = execSync('pactl info 2>/dev/null | grep "Default Sink:" | awk \'{print $3}\'', { encoding: 'utf8' }).trim();
+      if (defaultSink) {
+        return `${defaultSink}.monitor`;
+      }
+    } catch (e) {}
+    return null;
   }
 
   _startMicrophoneCaptureWithFallback(programs) {
     const queue = [...programs];
+    const monitorSource = this._getSystemAudioMonitor();
+    if (monitorSource) {
+      logger.info('System audio monitor detected, capturing interviewer audio', { device: monitorSource });
+    }
 
     const tryNextProgram = () => {
       const program = queue.shift();
@@ -1066,14 +1081,22 @@ class SpeechService extends EventEmitter {
       }
 
       try {
-        this.recording = recorder.record({
+        const recordOptions = {
           sampleRateHertz: 16000,
-          channels: 1,
+          channels: 2,
           threshold: 0,
           verbose: false,
           recordProgram: program,
           silence: '10.0s'
-        });
+        };
+
+        // Use system audio monitor (captures interviewer voice from Zoom/Meet/etc.)
+        if (monitorSource && program === 'arecord') {
+          recordOptions.device = monitorSource;
+          recordOptions.channels = 1;
+        }
+
+        this.recording = recorder.record(recordOptions);
 
         const stream = this.recording.stream();
         this.audioProgram = program;

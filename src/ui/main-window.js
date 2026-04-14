@@ -10,7 +10,7 @@ class MainWindowUI {
     constructor() {
         this.isInteractive = false;
         this.isHidden = false;
-        this.currentSkill = 'dsa'; // Default, will be updated from settings
+        this.currentSkill = 'general'; // Default, will be updated from settings
         this.statusDot = null;
         this.skillIndicator = null;
         this.micButton = null;
@@ -20,7 +20,10 @@ class MainWindowUI {
         
         // Define available skills for navigation
         this.availableSkills = [
-            'dsa'
+            'general',
+            'dsa',
+            'programming',
+            'system-design'
         ];
         
         this.init();
@@ -277,10 +280,11 @@ class MainWindowUI {
             }
         });
 
-        // Skill indicator click handler toggles DSA skill
+        // Skill indicator click handler cycles through available skills
         this.skillIndicator.addEventListener('click', () => {
             if (!this.isInteractive) return;
-            const newSkill = 'dsa';
+            const currentIndex = this.availableSkills.indexOf(this.currentSkill);
+            const newSkill = this.availableSkills[(currentIndex + 1) % this.availableSkills.length];
             if (window.electronAPI && window.electronAPI.updateActiveSkill) {
                 window.electronAPI.updateActiveSkill(newSkill).then(() => {
                     this.handleSkillActivated(newSkill);
@@ -486,8 +490,9 @@ class MainWindowUI {
     handleLLMResponse(data) {
         const skill = data.skill || data.metadata?.skill || 'General';
         const skillNames = {
+            'general': 'General',
             'dsa': 'DSA',
-            'behavioral': 'Behavioral', 
+            'behavioral': 'Behavioral',
             'sales': 'Sales',
             'presentation': 'Presentation',
             'data-science': 'Data Science',
@@ -626,8 +631,9 @@ class MainWindowUI {
 
     updateSkillIndicator() {
         const skillNames = {
+            'general': 'General',
             'dsa': 'DSA',
-            'behavioral': 'Behavioral', 
+            'behavioral': 'Behavioral',
             'sales': 'Sales',
             'presentation': 'Presentation',
             'data-science': 'Data Science',
@@ -739,8 +745,9 @@ class MainWindowUI {
 
     showSkillChangeNotification(skill, direction) {
         const skillNames = {
+            'general': 'General',
             'dsa': 'DSA',
-            'behavioral': 'Behavioral', 
+            'behavioral': 'Behavioral',
             'sales': 'Sales',
             'presentation': 'Presentation',
             'data-science': 'Data Science',
