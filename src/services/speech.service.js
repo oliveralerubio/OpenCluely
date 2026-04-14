@@ -424,6 +424,9 @@ class SpeechService extends EventEmitter {
     this.pendingFlush = false;
     this.audioProgram = null;
     this.whisperCommand = null;
+    this._cachedMonitorSource = undefined; // undefined = not probed, null = probed/not found
+    this._audioChunkCount = 0;
+    this._restartCount = 0;
 
     this.initializeClient();
   }
@@ -633,6 +636,9 @@ class SpeechService extends EventEmitter {
         });
       });
 
+      req.setTimeout(15000, () => {
+        req.destroy(new Error('STT API request timed out after 15s'));
+      });
       req.on('error', reject);
       req.write(body);
       req.end();
@@ -655,6 +661,7 @@ class SpeechService extends EventEmitter {
 
       this.sessionStartTime = Date.now();
       this.retryCount = 0;
+      this._restartCount = 0;
 
       if (this.provider === 'azure') {
         this._startAzureRecording();
@@ -918,7 +925,8 @@ class SpeechService extends EventEmitter {
     this.segmentBytes = 0;
     this.transcriptionInFlight = false;
     this.pendingFlush = false;
-    this._audioDataLogged = false;
+    this._audioChunkCount = 0;
+    this._restartCount = 0;
   }
 
   async recognizeFromFile(audioFilePath) {
@@ -1167,13 +1175,38 @@ class SpeechService extends EventEmitter {
   }
 
   _getSystemAudioMonitor() {
+    if (this._cachedMonitorSource !== undefined) {
+      return this._cachedMonitorSource;
+    }
+
     try {
       const { execSync } = require('child_process');
-      const defaultSink = execSync('pactl info 2>/dev/null | grep "Default Sink:" | awk \'{print $3}\'', { encoding: 'utf8' }).trim();
+      const defaultSink = execSync(
+        'pactl info 2>/dev/null | grep "Default Sink:" | awk \'{print $3}\'',
+        { encoding: 'utf8', timeout: 3000 }
+      ).trim();
       if (defaultSink) {
-        return `${defaultSink}.monitor`;
+        this._cachedMonitorSource = `${defaultSink}.monitor`;
+        return this._cachedMonitorSource;
       }
-    } catch (e) {}
+    } catch (e) {
+      logger.debug('pactl monitor detection failed, trying pw-cli', { error: e.message });
+    }
+
+    try {
+      const { execSync } = require('child_process');
+      const pwOutput = execSync('pw-cli info 0 2>/dev/null', { encoding: 'utf8', timeout: 3000 });
+      const match = pwOutput.match(/default\.audio\.sink\s*=\s*"([^"]+)"/);
+      if (match && match[1]) {
+        this._cachedMonitorSource = `${match[1]}.monitor`;
+        return this._cachedMonitorSource;
+      }
+    } catch (e) {
+      logger.debug('pw-cli monitor detection failed', { error: e.message });
+    }
+
+    logger.warn('Could not detect system audio monitor; falling back to default mic input');
+    this._cachedMonitorSource = null;
     return null;
   }
 
@@ -1194,17 +1227,15 @@ class SpeechService extends EventEmitter {
       try {
         const recordOptions = {
           sampleRateHertz: 16000,
-          channels: 2,
+          channels: 1,
           threshold: 0,
           verbose: false,
           recordProgram: program,
-          silence: '10.0s'
+          silence: '0'
         };
 
-        // Use system audio monitor (captures interviewer voice from Zoom/Meet/etc.)
         if (monitorSource && program === 'arecord') {
           recordOptions.device = monitorSource;
-          recordOptions.channels = 1;
         }
 
         this.recording = recorder.record(recordOptions);
@@ -1215,17 +1246,28 @@ class SpeechService extends EventEmitter {
         stream.on('error', (error) => {
           logger.error('Audio recording stream error', { error: error.message, program });
           if (this.recording) {
-            try {
-              this.recording.stop();
-            } catch (stopError) {
-              logger.error('Error stopping failed recording program', { error: stopError.message });
-            }
+            try { this.recording.stop(); } catch (e) {}
             this.recording = null;
           }
+          if (this.isRecording) tryNextProgram();
+        });
 
-          if (this.isRecording) {
-            tryNextProgram();
+        stream.on('end', () => {
+          if (!this.isRecording) return;
+          logger.warn('Audio stream ended unexpectedly, attempting restart', { program });
+          this._cachedMonitorSource = undefined; // re-probe on next start
+          if (this.recording) {
+            try { this.recording.stop(); } catch (e) {}
+            this.recording = null;
           }
+          if (this._restartCount >= 3) {
+            logger.error('Audio restart limit reached', { restarts: this._restartCount });
+            this.emit('error', `Audio stream died repeatedly after ${this._restartCount} restarts`);
+            return;
+          }
+          this._restartCount += 1;
+          logger.info('Restarting audio capture', { attempt: this._restartCount });
+          this._startMicrophoneCapture();
         });
 
         stream.on('data', (chunk) => {
@@ -1243,6 +1285,13 @@ class SpeechService extends EventEmitter {
   _handleAudioChunk(chunk) {
     if (!chunk || !chunk.length || !this.isRecording) {
       return;
+    }
+
+    this._audioChunkCount += 1;
+    if (this._audioChunkCount === 1) {
+      logger.debug('First audio chunk received — pipeline flowing', { program: this.audioProgram, bytes: chunk.length });
+    } else if (this._audioChunkCount % 10 === 0) {
+      logger.debug('Audio flowing', { chunks: this._audioChunkCount, bytes: chunk.length, segmentBytes: this.segmentBytes });
     }
 
     if (this.provider === 'azure' && this.pushStream) {
@@ -1281,6 +1330,9 @@ class SpeechService extends EventEmitter {
       if (transcript && transcript.trim()) {
         this.emit('transcription', transcript.trim());
       }
+    } catch (error) {
+      logger.error('Transcription failed persistently', { error: error.message });
+      this.emit('error', `Transcription failed: ${error.message}`);
     } finally {
       this.transcriptionInFlight = false;
 
@@ -1293,14 +1345,34 @@ class SpeechService extends EventEmitter {
   }
 
   async _transcribeWhisperBuffer(audioBuffer) {
+    if (audioBuffer.length < 8192) {
+      return ''; // skip near-silent segments
+    }
+
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'opencluely-whisper-'));
     const audioFilePath = path.join(tempDir, 'segment.wav');
 
     try {
       fs.writeFileSync(audioFilePath, this._createWavBuffer(audioBuffer));
+
       if (this.provider === 'groq' || this.provider === 'openai-stt') {
-        return await this._transcribeWithSttApi(audioFilePath);
+        let lastError;
+        for (let attempt = 0; attempt <= 2; attempt++) {
+          try {
+            return await this._transcribeWithSttApi(audioFilePath);
+          } catch (err) {
+            lastError = err;
+            logger.warn('STT API attempt failed', { attempt: attempt + 1, error: err.message });
+            if (attempt < 2) await new Promise(r => setTimeout(r, 500));
+          }
+        }
+        if (this.whisperCommand) {
+          logger.warn('STT API failed, falling back to local Whisper', { error: lastError.message });
+          return await this._transcribeWhisperFile(audioFilePath);
+        }
+        throw lastError;
       }
+
       return await this._transcribeWhisperFile(audioFilePath);
     } finally {
       this._removeTempDir(tempDir);
