@@ -447,7 +447,12 @@ class SpeechService extends EventEmitter {
       return;
     }
 
-    const reason = 'Speech recognition disabled. Configure Azure or local Whisper.';
+    if (provider === 'groq' || provider === 'openai-stt') {
+      this._initializeOpenAISttClient();
+      return;
+    }
+
+    const reason = 'Speech recognition disabled. Configure SPEECH_PROVIDER (azure, whisper, groq, openai-stt).';
     logger.warn(reason);
     this.emit('status', reason);
   }
@@ -536,6 +541,71 @@ class SpeechService extends EventEmitter {
     }
   }
 
+  _initializeOpenAISttClient() {
+    try {
+      if (!recorder || typeof recorder.record !== 'function') {
+        throw new Error('Local microphone recorder dependency is not installed');
+      }
+
+      const isGroq = this.provider === 'groq';
+      const apiKey = isGroq
+        ? (process.env.GROQ_API_KEY || this._getSetting('groqApiKey'))
+        : (process.env.STT_API_KEY || this._getSetting('sttApiKey'));
+
+      if (!apiKey) {
+        const reason = isGroq
+          ? 'GROQ_API_KEY not configured.'
+          : 'STT_API_KEY not configured.';
+        logger.warn(reason);
+        this.emit('status', reason);
+        return;
+      }
+
+      this.sttApiKey = apiKey;
+      this.sttApiBaseUrl = isGroq
+        ? 'https://api.groq.com/openai/v1'
+        : (process.env.STT_API_BASE_URL || 'https://api.openai.com/v1');
+      this.sttModel = process.env.STT_MODEL || (isGroq ? 'whisper-large-v3-turbo' : 'whisper-1');
+
+      this.available = true;
+      logger.info('OpenAI-compatible STT service initialized', {
+        provider: this.provider,
+        baseUrl: this.sttApiBaseUrl,
+        model: this.sttModel
+      });
+      this.emit('status', `${isGroq ? 'Groq' : 'OpenAI-compatible'} STT ready`);
+    } catch (error) {
+      logger.error('Failed to initialize OpenAI-compatible STT client', { error: error.message });
+      this.available = false;
+      this.emit('status', 'STT API unavailable');
+    }
+  }
+
+  async _transcribeWithSttApi(audioFilePath) {
+    const fileBuffer = fs.readFileSync(audioFilePath);
+    const blob = new Blob([fileBuffer], { type: 'audio/wav' });
+
+    const formData = new FormData();
+    formData.append('file', blob, 'audio.wav');
+    formData.append('model', this.sttModel);
+    formData.append('response_format', 'json');
+    formData.append('language', this._getWhisperLanguage() || 'en');
+
+    const response = await fetch(`${this.sttApiBaseUrl}/audio/transcriptions`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${this.sttApiKey}` },
+      body: formData
+    });
+
+    if (!response.ok) {
+      const errText = await response.text();
+      throw new Error(`STT API ${response.status}: ${errText}`);
+    }
+
+    const result = await response.json();
+    return (result.text || '').trim();
+  }
+
   startRecording() {
     try {
       if (!this.available) {
@@ -558,7 +628,7 @@ class SpeechService extends EventEmitter {
         return;
       }
 
-      if (this.provider === 'whisper') {
+      if (this.provider === 'whisper' || this.provider === 'groq' || this.provider === 'openai-stt') {
         this._startWhisperRecording();
         return;
       }
@@ -851,6 +921,10 @@ class SpeechService extends EventEmitter {
       return this._transcribeWhisperFile(audioFilePath);
     }
 
+    if (this.provider === 'groq' || this.provider === 'openai-stt') {
+      return this._transcribeWithSttApi(audioFilePath);
+    }
+
     throw new Error('Speech service not initialized');
   }
 
@@ -913,6 +987,10 @@ class SpeechService extends EventEmitter {
 
     if (this.provider === 'whisper') {
       return !!this.whisperCommand && !!this.available;
+    }
+
+    if (this.provider === 'groq' || this.provider === 'openai-stt') {
+      return !!this.sttApiKey && !!this.available;
     }
 
     return false;
@@ -1187,6 +1265,9 @@ class SpeechService extends EventEmitter {
 
     try {
       fs.writeFileSync(audioFilePath, this._createWavBuffer(audioBuffer));
+      if (this.provider === 'groq' || this.provider === 'openai-stt') {
+        return await this._transcribeWithSttApi(audioFilePath);
+      }
       return await this._transcribeWhisperFile(audioFilePath);
     } finally {
       this._removeTempDir(tempDir);
