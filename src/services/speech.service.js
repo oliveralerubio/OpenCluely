@@ -382,6 +382,7 @@ if (typeof window === 'undefined') {
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const https = require('https');
 const { spawn, spawnSync } = require('child_process');
 const { EventEmitter } = require('events');
 const logger = require('../core/logger').createServiceLogger('SPEECH');
@@ -583,27 +584,59 @@ class SpeechService extends EventEmitter {
 
   async _transcribeWithSttApi(audioFilePath) {
     const fileBuffer = fs.readFileSync(audioFilePath);
-    const blob = new Blob([fileBuffer], { type: 'audio/wav' });
+    const boundary = `----OpenCluely${Date.now().toString(36)}`;
+    const language = this._getWhisperLanguage() || 'en';
 
-    const formData = new FormData();
-    formData.append('file', blob, 'audio.wav');
-    formData.append('model', this.sttModel);
-    formData.append('response_format', 'json');
-    formData.append('language', this._getWhisperLanguage() || 'en');
+    const buildPart = (name, value) =>
+      Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`);
 
-    const response = await fetch(`${this.sttApiBaseUrl}/audio/transcriptions`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${this.sttApiKey}` },
-      body: formData
+    const filePart = Buffer.concat([
+      Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="audio.wav"\r\nContent-Type: audio/wav\r\n\r\n`),
+      fileBuffer,
+      Buffer.from('\r\n')
+    ]);
+
+    const body = Buffer.concat([
+      filePart,
+      buildPart('model', this.sttModel),
+      buildPart('response_format', 'json'),
+      buildPart('language', language),
+      Buffer.from(`--${boundary}--\r\n`)
+    ]);
+
+    const url = new URL(`${this.sttApiBaseUrl}/audio/transcriptions`);
+
+    return new Promise((resolve, reject) => {
+      const req = https.request({
+        hostname: url.hostname,
+        port: url.port || 443,
+        path: url.pathname + (url.search || ''),
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${this.sttApiKey}`,
+          'Content-Type': `multipart/form-data; boundary=${boundary}`,
+          'Content-Length': body.length
+        }
+      }, (res) => {
+        let raw = '';
+        res.on('data', chunk => { raw += chunk; });
+        res.on('end', () => {
+          if (res.statusCode !== 200) {
+            reject(new Error(`STT API ${res.statusCode}: ${raw}`));
+            return;
+          }
+          try {
+            resolve((JSON.parse(raw).text || '').trim());
+          } catch (e) {
+            reject(new Error(`Invalid STT response: ${raw}`));
+          }
+        });
+      });
+
+      req.on('error', reject);
+      req.write(body);
+      req.end();
     });
-
-    if (!response.ok) {
-      const errText = await response.text();
-      throw new Error(`STT API ${response.status}: ${errText}`);
-    }
-
-    const result = await response.json();
-    return (result.text || '').trim();
   }
 
   startRecording() {
@@ -1017,7 +1050,7 @@ class SpeechService extends EventEmitter {
   _getConfiguredProvider() {
     const provider = String(this._getSetting('speechProvider') || process.env.SPEECH_PROVIDER || '').trim().toLowerCase();
 
-    if (provider === 'azure' || provider === 'whisper') {
+    if (provider === 'azure' || provider === 'whisper' || provider === 'groq' || provider === 'openai-stt') {
       return provider;
     }
 
@@ -1221,7 +1254,7 @@ class SpeechService extends EventEmitter {
       return;
     }
 
-    if (this.provider === 'whisper') {
+    if (this.provider === 'whisper' || this.provider === 'groq' || this.provider === 'openai-stt') {
       this.segmentBuffers.push(Buffer.from(chunk));
       this.segmentBytes += chunk.length;
     }
